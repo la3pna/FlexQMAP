@@ -25,4 +25,4 @@ Setup:
 
 - Run the script in terminal:
 
-     python .\qmap_flex.py --radio 192.168.1.2 --daxiq 1 --gain 30 --invertq
+      python .\qmap_flex.py --radio 192.168.1.2 --daxiq 1 --gain 30 --invertq
