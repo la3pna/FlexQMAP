@@ -23,5 +23,6 @@ Setup:
 - 
   <img width="414" height="135" alt="image" src="https://github.com/user-attachments/assets/55d1eb6c-b982-4eb1-98fb-11ea405e5963" />
 
-- Run the script in terminal: 
+- Run the script in terminal:
+
      python .\qmap_flex.py --radio 192.168.1.2 --daxiq 1 --gain 30 --invertq
