@@ -23,6 +23,11 @@ Setup:
 - 
   <img width="414" height="135" alt="image" src="https://github.com/user-attachments/assets/55d1eb6c-b982-4eb1-98fb-11ea405e5963" />
 
+- set QMAP to:
+<img width="402" height="304" alt="image" src="https://github.com/user-attachments/assets/a831d994-3554-4640-b8a7-a984c5225c3c" />
+
+- configure the waterfall so that you get a propper working waterfall. Gain 2, zero 13 works for me. 
+
 - Run the script in terminal:
 
       python .\qmap_flex.py --radio 192.168.1.2 --daxiq 1 --gain 30 
