@@ -32,3 +32,5 @@ Setup:
 
       python .\qmap_flex.py --radio 192.168.1.2 --daxiq 1 --gain 30 
 make sure your radio IP address is correct
+
+<img width="1871" height="535" alt="image" src="https://github.com/user-attachments/assets/20610ab7-97ff-445e-8e95-5f215459582a" />
