@@ -1,7 +1,12 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Flex DAX IQ (stereo float32) -> QMAP (Linrad TIMF2-UDP) bridge
+Flex DAX IQ (stereo float32) -> QMAP (Linrad TIMF2 UDP) bridge
+Copyright (c) 2025 Thomas S. Knutsen, LA3PNA
+
+Other useful flags:
+  --gain G, --swapiq, --invertq, --tone F, --dcblock, --mix HZ,
+  --nrx {-1,2}, --int16, --rms, --debug
+
+cfreq is sent in MHz (what QMAP expects). Packets: 24B header + 174 * 8B payload = 1416B.
 """
 
 import argparse, socket, struct, sys, threading, time, math, select
@@ -14,7 +19,8 @@ import sounddevice as sd
 PKT_DOUBLES = 174
 FRAMES_PER_PACKET = PKT_DOUBLES
 BYTES_PER_PACKET = 1416
-HEADER_FMT = "<d i f i H b c"  # cfreq(MHz), msec, userfreq, iptr, iblk, nrx, iusb
+HEADER_FMT = "<d i f i H b c"  # cfreq(MHz), msec, userfreq, iptr, iblk(u16), nrx(i8), iusb(u8 as char)
+
 
 # ---- Radio-frekvens-state (MHz) ----
 class RadioFreqState:
@@ -165,12 +171,12 @@ def run_bridge(args):
     name_hint = args.device if args.device else f"DAX IQ RX {args.daxiq}"
     dev_index = find_dax_device(name_hint)
     if dev_index is None:
-        print(f"Fant ikke enhet som matcher '{name_hint}'.", file=sys.stderr); sys.exit(2)
+        print(f"Did not find a device matching '{name_hint}'.", file=sys.stderr); sys.exit(2)
 
     dev_info = sd.query_devices(dev_index)
     default_sr = float(dev_info["default_samplerate"])
     print(f"Bruker input device #{dev_index}: {dev_info['name']}")
-    print(f"Sender til {args.host}:{args.port} | DAXIQ={args.daxiq} | venter på pan/slice fra {args.radio}:4992")
+    print(f"Sending to {args.host}:{args.port} | DAXIQ={args.daxiq} | waiting for pan/slice from {args.radio}:4992")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     target = (args.host, args.port)
@@ -190,30 +196,31 @@ def run_bridge(args):
             device=dev_index, samplerate=want_rate, channels=2, dtype="float32",
             blocksize=FRAMES_PER_PACKET, extra_settings=extra
         ); stream.start(); in_rate = want_rate
-        if args.debug: print(f"Åpnet WASAPI Exclusive @ {want_rate} Hz" if extra else f"Åpnet @ {want_rate} Hz")
+        if args.debug: print(f"Opened WASAPI Exclusive @ {want_rate} Hz" if extra else f"Opened @ {want_rate} Hz")
     except Exception as e1:
-        if args.debug: print(f"WASAPI Exclusive @96k feilet ({e1}); prøver Shared @{default_sr:.0f} Hz")
+        if args.debug: print(f"WASAPI Exclusive @96k failed ({e1}); trying Shared @{default_sr:.0f} Hz")
         try:
             stream = sd.InputStream(
                 device=dev_index, samplerate=default_sr, channels=2, dtype="float32",
                 blocksize=int(round(FRAMES_PER_PACKET * default_sr / want_rate)) or 0
             ); stream.start(); in_rate = default_sr
             use_resampler = (abs(in_rate - want_rate) > 1)
-            if args.debug: print(f"Åpnet Shared @{in_rate:.0f} Hz  (resampler={'ON' if use_resampler else 'OFF'})")
+            if args.debug: print(f"Opened Shared @{in_rate:.0f} Hz  (resampler={'ON' if use_resampler else 'OFF'})")
         except Exception as e2:
-            print(f"Feil: klarte ikke å åpne InputStream: {e2}", file=sys.stderr); sys.exit(1)
+            print(f"Error: could not open InputStream: {e2}", file=sys.stderr); sys.exit(1)
 
     resamp = LinearResampler(in_rate=in_rate, out_rate=want_rate) if use_resampler else None
     last_stats_t = time.time(); pkts = 0
     last_rms_t = time.time()
 
-    # Oscillatorer for mix og testtone
+    # Oscillators for mixing and test tone
     mix_phase = 0.0
+    mix_parity = 0  # for Fs/2 mixing parity
     mix_inc = (2.0 * math.pi * (args.mix if args.mix else 0.0)) / want_rate
     tone_phase = 0.0
     tone_inc = (2.0 * math.pi * (args.tone if args.tone else 0.0)) / want_rate
 
-    # Enkel AGC (på float før ev. int16-konvertering)
+    # Simple AGC (on float before optional int16 conversion)
     agc_gain = 1.0
     def dbfs_from_rms(rms: float) -> float:
         return -120.0 if rms <= 1e-12 else 20.0 * math.log10(rms)
@@ -222,8 +229,8 @@ def run_bridge(args):
         if not args.agc: return
         cur_db = dbfs_from_rms(block_rms * agc_gain)
         err = args.agc_target_dbfs - cur_db
-        # enkel 1. ordens sløyfe: juster dB med en fraksjon per sekund
-        step_db = max(-6.0, min(6.0, err)) * (args.agc_speed / 10.0)  # dempet
+        # simple 1st-order loop: adjust dB by a fraction per second
+        step_db = max(-6.0, min(6.0, err)) * (args.agc_speed / 10.0)  
         agc_gain *= 10.0 ** (step_db / 20.0)
 
     def preprocess_block(block: np.ndarray) -> np.ndarray:
@@ -234,11 +241,11 @@ def run_bridge(args):
             b[:,0] -= np.mean(b[:,0], dtype=np.float64)
             b[:,1] -= np.mean(b[:,1], dtype=np.float64)
 
-        # Bruk fast gain
+        # Apply fixed gain
         if args.gain and args.gain != 1.0:
             b *= float(args.gain)
 
-        # AGC (etter fast gain, før iq-rotasjoner)
+        # AGC (after fixed gain, before IQ rotations)
         if args.agc:
             # rask RMS-estimat
             rms_est = float(np.sqrt(np.mean(b*b)))
@@ -251,47 +258,68 @@ def run_bridge(args):
         if args.invertq:
             b[:,1] = -b[:,1]
 
-        # Mix (kompleks frekvensforskyvning)
-        nonlocal mix_phase
+                # Mix (kompleks frekvensforskyvning)
+        # Note: Very large phases (float32) can make cos/sin inaccurate after a few minutes.
+        # Keep phase modulo 2π and use float64. For Fs/2 (f = ±Fs/2) use exact alternating sign (+1/-1).
+        nonlocal mix_phase, mix_parity
         if args.mix and args.mix != 0.0:
             n = b.shape[0]
-            t = mix_phase + mix_inc * np.arange(n, dtype=np.float32)
-            c = np.cos(t).astype(np.float32); s = np.sin(t).astype(np.float32)
-            I = b[:,0].copy(); Q = b[:,1].copy()
-            b[:,0] = I*c - Q*s
-            b[:,1] = I*s + Q*c
-            mix_phase = float(t[-1] + mix_inc)
+            fs = float(want_rate)  
+            f = float(args.mix)
 
-        # Testtone (svak, -30 dBfs)
+            # Special case: Fs/2 (swap upper/lower half-band) -> multiply every other sample by -1, exact and drift-free
+            if abs(abs(f) - fs/2.0) < 1e-6:
+                if mix_parity == 0:
+                    b[1::2, :] *= -1.0
+                else:
+                    b[0::2, :] *= -1.0
+                mix_parity ^= (n & 1)
+            else:
+                inc = (2.0 * math.pi * f) / fs
+                t = mix_phase + inc * np.arange(n, dtype=np.float64)
+                c = np.cos(t).astype(np.float32)
+                s = np.sin(t).astype(np.float32)
+                I = b[:, 0].copy()
+                Q = b[:, 1].copy()
+                b[:, 0] = I * c - Q * s
+                b[:, 1] = I * s + Q * c
+                mix_phase = float((mix_phase + inc * n) % (2.0 * math.pi))
+
+        # Test tone (low level, -30 dBFS)
         nonlocal tone_phase
         if args.tone and args.tone > 0:
             n = b.shape[0]
-            t = tone_phase + tone_inc * np.arange(n, dtype=np.float32)
-            c = np.cos(t).astype(np.float32) * 0.0316
-            s = np.sin(t).astype(np.float32) * 0.0316
-            I = b[:,0].copy(); Q = b[:,1].copy()
-            b[:,0] = I*c - Q*s
-            b[:,1] = I*s + Q*c
-            tone_phase = float(t[-1] + tone_inc)
+            fs = float(want_rate)
+            inc = (2.0 * math.pi * float(args.tone)) / fs
+            t = tone_phase + inc * np.arange(n, dtype=np.float64)
+            tone = (np.sin(t).astype(np.float32)) * (10.0 ** (-30.0/20.0))
+            b[:, 0] += tone
+            tone_phase = float((tone_phase + inc * n) % (2.0 * math.pi))
+
 
         return b
 
     def send_packet_block(iq_174: np.ndarray, cfreq_mhz: float):
-        nonlocal iblk, pkts, last_stats_t
+        nonlocal iblk, iptr, pkts, last_stats_t
         msec = ms_since_midnight_utc()
+
+        # Workarounds for receivers that are sensitive to iblk wrap-around:
+        #  - --iptrinc: make iptr a real 32-bit sample pointer (increments by 174 per packet)
+        #  - --iblk_zero: force iblk to 0 (use only if QMAP/QMAP-wf breaks after ~1–2 minutes)
+        iblk_field = 0 if args.iblk_zero else int(iblk & 0xFFFF)
         header = struct.pack(
             HEADER_FMT,
             float(cfreq_mhz),
             int(msec),
             float(args.userfreq),
             int(iptr),
-            int(iblk & 0xFFFF),
+            int(iblk_field),
             int(nrx),
             bytes([iusb])
         )
 
         if use_int16:
-            # Skaler til valgt fullskala (default 8192) – *ikke* 32767
+            # Scale to selected full-scale (default 8192) — *not* 32767
             s = np.clip(iq_174, -1.0, 1.0) * float(args.int16_scale)
             s = s.astype(np.int16)
             payload = bytearray(PKT_DOUBLES * 8); off = 0
@@ -311,7 +339,12 @@ def run_bridge(args):
             try: sock.sendto(pkt, target); pkts += 1
             except Exception as e: print(f"UDP send error: {e}", file=sys.stderr)
 
+        # Oppdater tellere
         iblk = (iblk + 1) & 0xFFFF
+        if args.iptrinc:
+            # iptr is used by many TIMF2 receivers as the sample pointer.
+            # Keep within signed int32 range.
+            iptr = (iptr + PKT_DOUBLES) & 0x7FFFFFFF
         if args.debug and (time.time() - last_stats_t) > 1.0:
             lvl_dbfs = 20.0*math.log10(max(1e-9, float(np.sqrt(np.mean(iq_174*iq_174)))))
             print(f"pkts/s={pkts}  cfreq={cfreq_mhz:.6f} MHz  in_rate={in_rate:.0f}  nrx={nrx}  "
@@ -348,32 +381,37 @@ def run_bridge(args):
                     print(f"RMS={rms:.4f}  max|x|={mx:.4f}")
                     last_rms_t = time.time()
     except KeyboardInterrupt:
-        print("\nAvslutter.")
+        print("\nExiting.")
     except Exception as e:
-        print(f"Feil i hovedloop: {e}", file=sys.stderr); sys.exit(1)
+        print(f"Error in main loop: {e}", file=sys.stderr); sys.exit(1)
 
 def main():
-    ap = argparse.ArgumentParser(description="Flex DAX IQ → QMAP UDP (cfreq i MHz, justerbar int16)")
-    ap.add_argument("--radio", required=True, help="IP til Flex-radio (SmartSDR TCP API, port 4992)")
-    ap.add_argument("--daxiq", type=int, default=1, help="DAX IQ kanal (default 1)")
+    ap = argparse.ArgumentParser(description="Flex DAX IQ → QMAP UDP (cfreq in MHz, adjustable int16)")
+    ap.add_argument("--radio", required=True, help="Flex radio IP (SmartSDR TCP API, port 4992)")
+    ap.add_argument("--daxiq", type=int, default=1, help="DAX IQ channel (default 1)")
     ap.add_argument("--host", default="127.0.0.1", help="QMAP IP/host (default 127.0.0.1)")
-    ap.add_argument("--port", type=int, default=50004, help="QMAP UDP-port (default 50004)")
-    ap.add_argument("--userfreq", type=float, default=0.0, help="Valgfri userfreq-felt (float)")
-    ap.add_argument("--device", default=None, help="Overstyr navn/substring på inputenhet")
-    ap.add_argument("--nrx", type=int, default=-1, choices=[-1,2], help="r*4 formatkode: -1 (default) eller +2")
-    ap.add_argument("--int16", action="store_true", help="Bruk i*2 (int16) med nrx=+1")
-    ap.add_argument("--int16_scale", type=int, default=8192, help="Fullskala for int16 (default 8192)")
-    ap.add_argument("--swapiq", action="store_true", help="Bytt (I,Q) -> (Q,I)")
-    ap.add_argument("--invertq", action="store_true", help="Sett Q := -Q")
-    ap.add_argument("--gain", type=float, default=1.0, help="Skaler inngang (default 1.0)")
-    ap.add_argument("--tone", type=float, default=0.0, help="Injiser kompleks testtone i Hz (0=av)")
-    ap.add_argument("--dcblock", action="store_true", help="Fjern DC pr. blokk")
-    ap.add_argument("--mix", type=float, default=0.0, help="Kompleks frekvensforskyvning i Hz (0=av)")
-    ap.add_argument("--agc", action="store_true", help="Aktiver enkel AGC")
-    ap.add_argument("--agc_target_dbfs", type=float, default=-20.0, help="AGC mål (dBFS), default -20")
-    ap.add_argument("--agc_speed", type=float, default=1.5, help="AGC hastighet (relativ), default 1.5")
-    ap.add_argument("--rms", action="store_true", help="Logg RMS/max|x| hvert sekund")
-    ap.add_argument("--debug", action="store_true", help="Debugutskrifter")
+    ap.add_argument("--port", type=int, default=50004, help="QMAP UDP port (default 50004)")
+    ap.add_argument("--userfreq", type=float, default=0.0, help="Optional userfreq field (float)")
+    ap.add_argument("--device", default=None, help="Override input device name/substring match")
+    ap.add_argument("--nrx", type=int, default=-1, choices=[-1,2], help="r*4 format code: -1 (default) or +2")
+    ap.add_argument("--int16", action="store_true", help="Use i*2 (int16) with nrx=+1")
+    ap.add_argument("--int16_scale", type=int, default=8192, help="Full-scale for int16 (default 8192)")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--swapiq", dest="swapiq", action="store_true", help="Swap (I,Q) -> (Q,I) (default)")
+    g.add_argument("--noswapiq", dest="swapiq", action="store_false", help="Do not swap I/Q")
+    ap.set_defaults(swapiq=True)
+    ap.add_argument("--invertq", action="store_true", help="Set Q := -Q")
+    ap.add_argument("--iptrinc", action="store_true", help="Increment iptr (32-bit) by 174 per packet (recommended for stability)")
+    ap.add_argument("--iblk_zero", action="store_true", help="Force iblk=0 in the header (workaround if the receiver misbehaves on wrap)")
+    ap.add_argument("--gain", type=float, default=1.0, help="Scale input (default 1.0)")
+    ap.add_argument("--tone", type=float, default=0.0, help="Inject complex test tone in Hz (0=off)")
+    ap.add_argument("--dcblock", action="store_true", help="Remove DC per block")
+    ap.add_argument("--mix", type=float, default=-48000.0, help="Complex frequency shift in Hz (0=off)")
+    ap.add_argument("--agc", action="store_true", help="Enable simple AGC")
+    ap.add_argument("--agc_target_dbfs", type=float, default=-20.0, help="AGC target (dBFS), default -20")
+    ap.add_argument("--agc_speed", type=float, default=1.5, help="AGC speed (relative), default 1.5")
+    ap.add_argument("--rms", action="store_true", help="Log RMS/max|x| once per second")
+    ap.add_argument("--debug", action="store_true", help="Debug prints")
     args = ap.parse_args()
     run_bridge(args)
 
