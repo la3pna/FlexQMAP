@@ -64,9 +64,9 @@ TIMF2 calls them “doubles” because each slot is **8 bytes**, regardless of w
 
 Each sample-slot is:
 
-**
-< f  f
-**
+
+** f  f**
+
 
 - 4 bytes float32 = **I**
 - 4 bytes float32 = **Q**
@@ -81,9 +81,7 @@ Typical range:
 
 Each sample-slot is 8 bytes, but only the first 4 contain IQ:
 
-**
-< h  h  0 0 0 0
-**
+** h  h  0 0 0 0**
 
 - 2 bytes int16 = **I**
 - 2 bytes int16 = **Q**
