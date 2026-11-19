@@ -5,13 +5,14 @@
 Usage: 
 
      python .\qmap_flex.py --radio 192.168.1.2 --daxiq 1 --gain 30 
+     python .\qmap_flex.py --gui
 
 
 Setup: 
 - Install Python, make sure to select "add to path"
 - Install dependencies, in a terminal type:
     python -m pip install --upgrade numpy sounddevice
-- In Windows sound, set DAX IQ RX 1 to "2 channels, 24-bit, 96000Hz"
+- In Windows sound, set the DAX IQ input to 2 channels at 96000Hz. The device is named `DAX IQ RX 1` with DAXv1 (SmartSDR 4.1.5) and `DAX IQ 1 (FlexRadio DAX)` with DAXv2 (SmartSDR 4.2.18 and later); Windows may show 24-bit or 32-bit depending on the driver version.
 - 
   <img width="404" height="462" alt="image" src="https://github.com/user-attachments/assets/1c7cf4b1-a1e2-4473-9b8f-3f3e595d6544" />
 
@@ -35,6 +36,10 @@ make sure your radio IP address is correct
 
 <img width="1871" height="535" alt="image" src="https://github.com/user-attachments/assets/20610ab7-97ff-445e-8e95-5f215459582a" />
 
+## Graphical launcher
+
+Run `python .\qmap_flex.py --gui` to open a simple window for the radio address, DAX IQ channel, QMAP destination, gain, mixing, and common IQ/AGC options. The window shows the bridge output and provides Start and Stop buttons. The command-line interface remains available as before.
+
 ---
 
 ## Some settings
@@ -42,7 +47,7 @@ make sure your radio IP address is correct
 DAX IQ channel number.  
 
 ### `--device <substring>`
-Alternative to use a input device. Usage: --device "DAX IQ RX 1"
+Optional input-device name override. Without it, the script checks for both `DAX IQ 1 (FlexRadio DAX)` (DAXv2) and `DAX IQ RX 1` (DAXv1). Example: `--device "DAX IQ 1 (FlexRadio DAX)"`.
 
 ### `--swapiq` / `--noswapiq`
 Swaps I and Q.

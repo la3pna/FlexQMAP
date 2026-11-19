@@ -9,9 +9,9 @@ Other useful flags:
 cfreq is sent in MHz (what QMAP expects). Packets: 24B header + 174 * 8B payload = 1416B.
 """
 
-import argparse, socket, struct, sys, threading, time, math, select
+import argparse, os, queue, socket, struct, subprocess, sys, threading, time, math, select
 from datetime import datetime, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, Sequence
 import numpy as np
 import sounddevice as sd
 
@@ -126,20 +126,32 @@ def ms_since_midnight_utc() -> int:
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return int((now - midnight).total_seconds() * 1000)
 
-def find_dax_device(name_hint: str) -> Optional[int]:
+def find_dax_device(name_hints: Sequence[str]) -> Optional[int]:
     devices = sd.query_devices(); hostapis = sd.query_hostapis()
     wasapi_index = None
     for i, ha in enumerate(hostapis):
         if "WASAPI" in ha.get("name",""): wasapi_index = i; break
-    candidate = None
-    for idx, d in enumerate(devices):
-        if d["max_input_channels"] >= 2:
-            name = d.get("name","")
-            if name_hint.lower() in name.lower():
-                if wasapi_index is None or d["hostapi"] == wasapi_index:
-                    return idx
+    for name_hint in name_hints:
+        candidate = None
+        hint = name_hint.lower()
+        for idx, d in enumerate(devices):
+            if d["max_input_channels"] < 2:
+                continue
+            name = d.get("name", "")
+            name_lower = name.lower()
+            match_start = name_lower.find(hint)
+            if match_start < 0:
+                continue
+            match_end = match_start + len(hint)
+            if hint[-1:].isdigit() and match_end < len(name) and name[match_end].isdigit():
+                continue
+            if wasapi_index is None or d["hostapi"] == wasapi_index:
+                return idx
+            if candidate is None:
                 candidate = idx
-    return candidate
+        if candidate is not None:
+            return candidate
+    return None
 
 class LinearResampler:
     def __init__(self, in_rate: float, out_rate: float = 96000.0):
@@ -168,10 +180,13 @@ def run_bridge(args):
     state = RadioFreqState()
     threading.Thread(target=api_reader_thread, args=(args.radio, args.daxiq, state, args.debug), daemon=True).start()
 
-    name_hint = args.device if args.device else f"DAX IQ RX {args.daxiq}"
-    dev_index = find_dax_device(name_hint)
+    name_hints = (args.device,) if args.device else (
+        f"DAX IQ {args.daxiq} (FlexRadio DAX)",
+        f"DAX IQ RX {args.daxiq}",
+    )
+    dev_index = find_dax_device(name_hints)
     if dev_index is None:
-        print(f"Did not find a device matching '{name_hint}'.", file=sys.stderr); sys.exit(2)
+        print(f"Did not find an input device matching any of: {', '.join(name_hints)}.", file=sys.stderr); sys.exit(2)
 
     dev_info = sd.query_devices(dev_index)
     default_sr = float(dev_info["default_samplerate"])
@@ -386,11 +401,12 @@ def run_bridge(args):
         print(f"Error in main loop: {e}", file=sys.stderr); sys.exit(1)
 
 def main():
-    ap = argparse.ArgumentParser(description="Flex DAX IQ → QMAP UDP (cfreq in MHz, adjustable int16)")
-    ap.add_argument("--radio", required=True, help="Flex radio IP (SmartSDR TCP API, port 4992)")
+    ap = argparse.ArgumentParser(description="Flex DAX IQ to QMAP UDP (cfreq in MHz, adjustable int16)")
+    ap.add_argument("--radio", help="Flex radio IP (SmartSDR TCP API, port 4992)")
     ap.add_argument("--daxiq", type=int, default=1, help="DAX IQ channel (default 1)")
     ap.add_argument("--host", default="127.0.0.1", help="QMAP IP/host (default 127.0.0.1)")
     ap.add_argument("--port", type=int, default=50004, help="QMAP UDP port (default 50004)")
+    ap.add_argument("--gui", action="store_true", help="Open the graphical launcher")
     ap.add_argument("--userfreq", type=float, default=0.0, help="Optional userfreq field (float)")
     ap.add_argument("--device", default=None, help="Override input device name/substring match")
     ap.add_argument("--nrx", type=int, default=-1, choices=[-1,2], help="r*4 format code: -1 (default) or +2")
@@ -413,7 +429,195 @@ def main():
     ap.add_argument("--rms", action="store_true", help="Log RMS/max|x| once per second")
     ap.add_argument("--debug", action="store_true", help="Debug prints")
     args = ap.parse_args()
+    if args.gui:
+        launch_gui(args)
+        return
+    if not args.radio:
+        ap.error("--radio is required unless --gui is used")
     run_bridge(args)
+
+def launch_gui(args):
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    root = tk.Tk()
+    root.title("FlexQMAP")
+    root.minsize(620, 560)
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(1, weight=1)
+
+    settings = ttk.Frame(root, padding=12)
+    settings.grid(row=0, column=0, sticky="ew")
+    settings.columnconfigure(1, weight=1)
+    settings.columnconfigure(3, weight=1)
+
+    fields = {
+        "radio": tk.StringVar(value=args.radio or ""),
+        "daxiq": tk.StringVar(value=str(args.daxiq)),
+        "host": tk.StringVar(value=args.host),
+        "port": tk.StringVar(value=str(args.port)),
+        "device": tk.StringVar(value=args.device or ""),
+        "gain": tk.StringVar(value=str(args.gain)),
+        "mix": tk.StringVar(value=str(args.mix)),
+        "agc_target_dbfs": tk.StringVar(value=str(args.agc_target_dbfs)),
+        "agc_speed": tk.StringVar(value=str(args.agc_speed)),
+        "int16_scale": tk.StringVar(value=str(args.int16_scale)),
+    }
+
+    def add_field(row, column, label, key, width=22):
+        ttk.Label(settings, text=label).grid(row=row, column=column, sticky="w", padx=(0, 6), pady=4)
+        entry = ttk.Entry(settings, textvariable=fields[key], width=width)
+        entry.grid(row=row, column=column + 1, sticky="ew", padx=(0, 12), pady=4)
+
+    add_field(0, 0, "Flex radio IP", "radio")
+    add_field(0, 2, "DAX IQ channel", "daxiq")
+    add_field(1, 0, "QMAP host", "host")
+    add_field(1, 2, "QMAP UDP port", "port")
+    add_field(2, 0, "Device override", "device")
+    add_field(3, 0, "Gain", "gain")
+    add_field(3, 2, "Mix frequency (Hz)", "mix")
+    add_field(4, 0, "AGC target (dBFS)", "agc_target_dbfs")
+    add_field(4, 2, "AGC speed", "agc_speed")
+    add_field(5, 0, "Int16 scale", "int16_scale")
+
+    ttk.Label(
+        settings,
+        text="Device override is optional; DAXv1 and DAXv2 names are detected automatically.",
+        wraplength=560,
+    ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(2, 6))
+
+    options = ttk.Frame(settings)
+    options.grid(row=7, column=0, columnspan=4, sticky="w")
+    option_values = {
+        "swapiq": tk.BooleanVar(value=args.swapiq),
+        "invertq": tk.BooleanVar(value=args.invertq),
+        "dcblock": tk.BooleanVar(value=args.dcblock),
+        "agc": tk.BooleanVar(value=args.agc),
+        "int16": tk.BooleanVar(value=args.int16),
+        "rms": tk.BooleanVar(value=args.rms),
+        "debug": tk.BooleanVar(value=args.debug),
+    }
+    for column, (key, label) in enumerate((
+        ("swapiq", "Swap I/Q"),
+        ("invertq", "Invert Q"),
+        ("dcblock", "Remove DC"),
+        ("agc", "Enable AGC"),
+        ("int16", "Send int16"),
+        ("rms", "Show RMS"),
+        ("debug", "Debug"),
+    )):
+        ttk.Checkbutton(options, text=label, variable=option_values[key]).grid(
+            row=0, column=column, sticky="w", padx=(0, 10), pady=4
+        )
+
+    log_frame = ttk.LabelFrame(root, text="Output", padding=8)
+    log_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+    log_frame.columnconfigure(0, weight=1)
+    log_frame.rowconfigure(0, weight=1)
+    output = tk.Text(log_frame, height=12, wrap="word", state="disabled")
+    scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=output.yview)
+    output.configure(yscrollcommand=scrollbar.set)
+    output.grid(row=0, column=0, sticky="nsew")
+    scrollbar.grid(row=0, column=1, sticky="ns")
+
+    controls = ttk.Frame(root, padding=(12, 0, 12, 12))
+    controls.grid(row=2, column=0, sticky="ew")
+    log_queue = queue.Queue()
+    active_process = None
+
+    def append_output(line):
+        output.configure(state="normal")
+        output.insert("end", line + "\n")
+        output.see("end")
+        output.configure(state="disabled")
+
+    def poll_output():
+        nonlocal active_process
+        while True:
+            try:
+                kind, value = log_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "line":
+                append_output(value)
+            elif kind == "exit":
+                append_output(f"Bridge stopped (exit code {value}).")
+                active_process = None
+                start_button.configure(state="normal")
+                stop_button.configure(state="disabled")
+            elif kind == "error":
+                append_output(f"Could not start bridge: {value}")
+                active_process = None
+                start_button.configure(state="normal")
+                stop_button.configure(state="disabled")
+        root.after(100, poll_output)
+
+    def start_bridge():
+        nonlocal active_process
+        if active_process is not None and active_process.poll() is None:
+            return
+        if not fields["radio"].get().strip():
+            messagebox.showerror("Missing radio address", "Enter the Flex radio IP address.")
+            return
+        command = [
+            sys.executable, os.path.abspath(__file__),
+            "--radio", fields["radio"].get().strip(),
+            "--daxiq", fields["daxiq"].get().strip(),
+            "--host", fields["host"].get().strip(),
+            "--port", fields["port"].get().strip(),
+            "--gain", fields["gain"].get().strip(),
+            "--mix", fields["mix"].get().strip(),
+            "--agc_target_dbfs", fields["agc_target_dbfs"].get().strip(),
+            "--agc_speed", fields["agc_speed"].get().strip(),
+            "--int16_scale", fields["int16_scale"].get().strip(),
+        ]
+        if fields["device"].get().strip():
+            command.extend(("--device", fields["device"].get().strip()))
+        command.append("--swapiq" if option_values["swapiq"].get() else "--noswapiq")
+        for key in ("invertq", "dcblock", "agc", "int16", "rms", "debug"):
+            if option_values[key].get():
+                command.append("--" + key)
+        try:
+            active_process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            messagebox.showerror("Could not start bridge", str(exc))
+            return
+
+        process = active_process
+        start_button.configure(state="disabled")
+        stop_button.configure(state="normal")
+        append_output("Starting bridge...")
+
+        def read_process_output():
+            if process.stdout is not None:
+                for line in process.stdout:
+                    log_queue.put(("line", line.rstrip()))
+            log_queue.put(("exit", process.wait()))
+
+        threading.Thread(target=read_process_output, daemon=True).start()
+
+    def stop_bridge():
+        if active_process is not None and active_process.poll() is None:
+            active_process.terminate()
+
+    def close_window():
+        if active_process is not None and active_process.poll() is None:
+            active_process.terminate()
+        root.destroy()
+
+    start_button = ttk.Button(controls, text="Start bridge", command=start_bridge)
+    start_button.pack(side="left")
+    stop_button = ttk.Button(controls, text="Stop", command=stop_bridge, state="disabled")
+    stop_button.pack(side="left", padx=(8, 0))
+    root.protocol("WM_DELETE_WINDOW", close_window)
+    root.after(100, poll_output)
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
