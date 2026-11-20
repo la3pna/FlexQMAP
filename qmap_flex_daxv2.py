@@ -1,0 +1,670 @@
+"""
+Flex DAX IQ (stereo float32) -> QMAP (Linrad TIMF2 UDP) bridge
+Copyright (c) 2025 Thomas S. Knutsen, LA3PNA
+
+Other useful flags:
+  --gain G, --swapiq, --invertq, --tone F, --dcblock, --mix HZ,
+  --nrx {-1,2}, --int16, --rms, --debug
+
+cfreq is sent in MHz (what QMAP expects). Packets: 24B header + 174 * 8B payload = 1416B.
+"""
+
+import argparse, os, queue, socket, struct, subprocess, sys, threading, time, math, select
+from datetime import datetime, timezone
+from typing import Optional, Dict, Sequence
+import numpy as np
+import sounddevice as sd
+
+# ---- QMAP/TIMF2 ----
+PKT_DOUBLES = 174
+FRAMES_PER_PACKET = PKT_DOUBLES
+BYTES_PER_PACKET = 1416
+HEADER_FMT = "<d i f i H b c"  # cfreq(MHz), msec, userfreq, iptr, iblk(u16), nrx(i8), iusb(u8 as char)
+
+
+# ---- Radio-frekvens-state (MHz) ----
+class RadioFreqState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pan_center_by_handle: Dict[str,float] = {}
+        self.pan_for_daxiq: Dict[int,str] = {}
+        self.slice_freq_by_dax: Dict[int,float] = {}
+        self.last_any_pan_center: Optional[float] = None
+    def set_pan_center(self, handle: str, mhz: float):
+        with self.lock:
+            self.pan_center_by_handle[handle] = mhz
+            self.last_any_pan_center = mhz
+    def set_daxiq_pan(self, ch: int, handle: str):
+        with self.lock:
+            self.pan_for_daxiq[ch] = handle
+    def set_slice_freq_for_dax(self, ch: int, mhz: float):
+        with self.lock:
+            self.slice_freq_by_dax[ch] = mhz
+    def get_center_mhz_for(self, daxiq_ch: int) -> Optional[float]:
+        with self.lock:
+            h = self.pan_for_daxiq.get(daxiq_ch)
+            if h and h in self.pan_center_by_handle:
+                return self.pan_center_by_handle[h]
+            if daxiq_ch in self.slice_freq_by_dax:
+                return self.slice_freq_by_dax[daxiq_ch]
+            return self.last_any_pan_center
+
+# ---- SmartSDR API ----
+def api_reader_thread(radio_ip: str, daxiq_ch: int, state: RadioFreqState, debug=False):
+    port = 4992
+    def strip_prefix(txt: str) -> str:
+        if "|" in txt and txt[0] in ("S","R","H","M"):
+            return txt.split("|",1)[1]
+        return txt
+    while True:
+        try:
+            s = socket.create_connection((radio_ip, port), timeout=5.0)
+            s.setblocking(False)
+            f = s.makefile("rwb", buffering=0)
+            t0 = time.time()
+            while time.time() - t0 < 1.0:
+                r, _, _ = select.select([s], [], [], 0.05)
+                if not r: continue
+                line = f.readline()
+                if not line: break
+                if debug: sys.stderr.write(line.decode(errors="ignore"))
+            for c in (b"C1|sub pan all\n", b"C2|sub slice all\n", b"C3|sub daxiq all\n"):
+                f.write(c)
+            buf = b""; last_msg = time.time()
+            while True:
+                r, _, _ = select.select([s], [], [], 0.2)
+                if r:
+                    chunk = s.recv(4096)
+                    if not chunk: raise OSError("socket closed")
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        msg = strip_prefix(line.decode(errors="ignore").strip())
+                        if "display pan " in msg:
+                            try:
+                                parts = msg.split(); handle = parts[2]
+                                for tok in parts:
+                                    if tok.startswith("center="):
+                                        mhz = float(tok.split("=",1)[1])
+                                        state.set_pan_center(handle, mhz)
+                                        if debug: print(f"[API] pan {handle} center={mhz:.6f} MHz")
+                                        break
+                            except Exception: pass
+                        if "daxiq " in msg:
+                            try:
+                                parts = msg.split(); ch = int(parts[1])
+                                if ch == daxiq_ch:
+                                    for tok in parts[2:]:
+                                        if tok.startswith("pan="):
+                                            handle = tok.split("=",1)[1]
+                                            state.set_daxiq_pan(ch, handle)
+                                            if debug: print(f"[API] daxiq {ch} -> pan {handle}")
+                                            break
+                            except Exception: pass
+                        if msg.startswith("slice "):
+                            try:
+                                mhz = None; dax = None
+                                for tok in msg.split():
+                                    if tok.startswith("freq="): mhz = float(tok.split("=",1)[1])
+                                    elif tok.startswith("dax="): dax = int(tok.split("=",1)[1])
+                                if mhz is not None and dax is not None:
+                                    state.set_slice_freq_for_dax(dax, mhz)
+                                    if debug: print(f"[API] slice dax={dax} freq={mhz:.6f} MHz")
+                            except Exception: pass
+                        last_msg = time.time()
+                if time.time() - last_msg > 10:
+                    try: f.write(b"C9|version\n"); last_msg = time.time()
+                    except Exception: break
+            s.close()
+        except Exception as e:
+            if debug: print(f"[API] reconnect in 2s ({e})")
+            time.sleep(2.0)
+
+# ---- Diverse ----
+def ms_since_midnight_utc() -> int:
+    now = datetime.now(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((now - midnight).total_seconds() * 1000)
+
+def find_dax_device(name_hints: Sequence[str]) -> Optional[int]:
+    devices = sd.query_devices(); hostapis = sd.query_hostapis()
+    wasapi_index = None
+    for i, ha in enumerate(hostapis):
+        if "WASAPI" in ha.get("name",""): wasapi_index = i; break
+    for name_hint in name_hints:
+        candidate = None
+        hint = name_hint.lower()
+        for idx, d in enumerate(devices):
+            if d["max_input_channels"] < 2:
+                continue
+            name = d.get("name", "")
+            name_lower = name.lower()
+            match_start = name_lower.find(hint)
+            if match_start < 0:
+                continue
+            match_end = match_start + len(hint)
+            if hint[-1:].isdigit() and match_end < len(name) and name[match_end].isdigit():
+                continue
+            if wasapi_index is None or d["hostapi"] == wasapi_index:
+                return idx
+            if candidate is None:
+                candidate = idx
+        if candidate is not None:
+            return candidate
+    return None
+
+class LinearResampler:
+    def __init__(self, in_rate: float, out_rate: float = 96000.0):
+        self.in_rate = float(in_rate); self.out_rate = float(out_rate)
+        self.inc = self.in_rate / self.out_rate; self.t = 0.0
+        self.buf = np.zeros((0,2), dtype=np.float32)
+    def push(self, x): self.buf = x.copy() if self.buf.size==0 else np.vstack((self.buf,x))
+    def available_output_frames(self) -> int:
+        if self.buf.shape[0] < 2: return 0
+        max_src_index = self.buf.shape[0] - 1 - 1e-6
+        if self.t > max_src_index: return 0
+        return int(np.floor((max_src_index - self.t) / self.inc)) + 1
+    def pop_frames(self, n_out: int) -> np.ndarray:
+        if n_out <= 0: return np.zeros((0,2), np.float32)
+        idx = self.t + self.inc * np.arange(n_out, dtype=np.float64)
+        i0 = np.floor(idx).astype(np.int64); frac = (idx - i0).astype(np.float32)
+        i1 = np.clip(i0 + 1, 0, self.buf.shape[0]-1)
+        y = (1.0 - frac)[:,None]*self.buf[i0,:] + frac[:,None]*self.buf[i1,:]
+        self.t += self.inc * n_out
+        drop = int(np.floor(self.t))
+        if drop > 0: self.buf = self.buf[drop:,:]; self.t -= drop
+        return y.astype(np.float32)
+
+# ---- Bro ----
+def run_bridge(args):
+    state = RadioFreqState()
+    threading.Thread(target=api_reader_thread, args=(args.radio, args.daxiq, state, args.debug), daemon=True).start()
+
+    name_hints = (args.device,) if args.device else (
+        f"DAX IQ {args.daxiq} (FlexRadio DAX)",
+        f"DAX IQ RX {args.daxiq}",
+    )
+    dev_index = find_dax_device(name_hints)
+    if dev_index is None:
+        print(f"Did not find an input device matching any of: {', '.join(name_hints)}.", file=sys.stderr); sys.exit(2)
+
+    dev_info = sd.query_devices(dev_index)
+    default_sr = float(dev_info["default_samplerate"])
+    print(f"Bruker input device #{dev_index}: {dev_info['name']}")
+    print(f"Sending to {args.host}:{args.port} | DAXIQ={args.daxiq} | waiting for pan/slice from {args.radio}:4992")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    target = (args.host, args.port)
+
+    use_int16 = args.int16
+    nrx = 1 if use_int16 else args.nrx  # +1 for i*2, ellers -1/+2 for r*4
+    iusb = 0; iptr = 0; iblk = 0
+
+    want_rate = 96000
+    use_resampler = False
+
+    # DAXv2: stor blokk for innlesing; QMAP UDP beholdes på 174 IQ-par.
+    read_frames = 2048
+    host_api_name = sd.query_hostapis(dev_info["hostapi"])["name"]
+    attempts = []
+    if "WASAPI" in host_api_name.upper():
+        try:
+            attempts.append(("WASAPI Exclusive 96k", want_rate, sd.WasapiSettings(exclusive=True)))
+        except Exception as exc:
+            if args.debug:
+                print(f"WASAPI settings unavailable: {exc}")
+    attempts.append(("Shared 96k", want_rate, None))
+    if abs(default_sr - want_rate) > 1:
+        attempts.append(("Shared device default", default_sr, None))
+    stream = None
+    failures = []
+    for label, rate, extra in attempts:
+        try:
+            stream = sd.InputStream(
+                device=dev_index, samplerate=rate, channels=2,
+                dtype="float32", blocksize=0, latency="high",
+                extra_settings=extra,
+            )
+            stream.start()
+            in_rate = float(rate)
+            use_resampler = abs(in_rate - want_rate) > 1
+            print(f"Opened {label} @{in_rate:.0f} Hz  "
+                  f"(resampler={'ON' if use_resampler else 'OFF'}, "
+                  f"read_frames={read_frames})")
+            break
+        except Exception as exc:
+            failures.append(f"{label}: {exc}")
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            stream = None
+            if args.debug:
+                print(f"Could not open {label}: {exc}")
+    if stream is None:
+        raise RuntimeError("DAX IQ cannot be opened: " + "; ".join(failures))
+    resamp = LinearResampler(in_rate=in_rate, out_rate=want_rate) if use_resampler else None
+    last_stats_t = time.time(); pkts = 0
+    last_rms_t = time.time()
+
+    # Oscillators for mixing and test tone
+    mix_phase = 0.0
+    mix_parity = 0  # for Fs/2 mixing parity
+    mix_inc = (2.0 * math.pi * (args.mix if args.mix else 0.0)) / want_rate
+    tone_phase = 0.0
+    tone_inc = (2.0 * math.pi * (args.tone if args.tone else 0.0)) / want_rate
+
+    # Simple AGC (on float before optional int16 conversion)
+    agc_gain = 1.0
+    def dbfs_from_rms(rms: float) -> float:
+        return -120.0 if rms <= 1e-12 else 20.0 * math.log10(rms)
+    def agc_update(block_rms: float):
+        nonlocal agc_gain
+        if not args.agc: return
+        cur_db = dbfs_from_rms(block_rms * agc_gain)
+        err = args.agc_target_dbfs - cur_db
+        # simple 1st-order loop: adjust dB by a fraction per second
+        step_db = max(-6.0, min(6.0, err)) * (args.agc_speed / 10.0)  
+        agc_gain *= 10.0 ** (step_db / 20.0)
+
+    def preprocess_block(block: np.ndarray) -> np.ndarray:
+        b = block.astype(np.float32, copy=True)
+
+        # DC-block
+        if args.dcblock:
+            b[:,0] -= np.mean(b[:,0], dtype=np.float64)
+            b[:,1] -= np.mean(b[:,1], dtype=np.float64)
+
+        # Apply fixed gain
+        if args.gain and args.gain != 1.0:
+            b *= float(args.gain)
+
+        # AGC (after fixed gain, before IQ rotations)
+        if args.agc:
+            # rask RMS-estimat
+            rms_est = float(np.sqrt(np.mean(b*b)))
+            agc_update(rms_est)
+            b *= agc_gain
+
+        # Swap / invert
+        if args.swapiq:
+            b = b[:, [1,0]]
+        if args.invertq:
+            b[:,1] = -b[:,1]
+
+                # Mix (kompleks frekvensforskyvning)
+        # Note: Very large phases (float32) can make cos/sin inaccurate after a few minutes.
+        # Keep phase modulo 2π and use float64. For Fs/2 (f = ±Fs/2) use exact alternating sign (+1/-1).
+        nonlocal mix_phase, mix_parity
+        if args.mix and args.mix != 0.0:
+            n = b.shape[0]
+            fs = float(want_rate)  
+            f = float(args.mix)
+
+            # Special case: Fs/2 (swap upper/lower half-band) -> multiply every other sample by -1, exact and drift-free
+            if abs(abs(f) - fs/2.0) < 1e-6:
+                if mix_parity == 0:
+                    b[1::2, :] *= -1.0
+                else:
+                    b[0::2, :] *= -1.0
+                mix_parity ^= (n & 1)
+            else:
+                inc = (2.0 * math.pi * f) / fs
+                t = mix_phase + inc * np.arange(n, dtype=np.float64)
+                c = np.cos(t).astype(np.float32)
+                s = np.sin(t).astype(np.float32)
+                I = b[:, 0].copy()
+                Q = b[:, 1].copy()
+                b[:, 0] = I * c - Q * s
+                b[:, 1] = I * s + Q * c
+                mix_phase = float((mix_phase + inc * n) % (2.0 * math.pi))
+
+        # Test tone (low level, -30 dBFS)
+        nonlocal tone_phase
+        if args.tone and args.tone > 0:
+            n = b.shape[0]
+            fs = float(want_rate)
+            inc = (2.0 * math.pi * float(args.tone)) / fs
+            t = tone_phase + inc * np.arange(n, dtype=np.float64)
+            tone = (np.sin(t).astype(np.float32)) * (10.0 ** (-30.0/20.0))
+            b[:, 0] += tone
+            tone_phase = float((tone_phase + inc * n) % (2.0 * math.pi))
+
+
+        return b
+
+    def send_packet_block(iq_174: np.ndarray, cfreq_mhz: float):
+        nonlocal iblk, iptr, pkts, last_stats_t
+        msec = ms_since_midnight_utc()
+
+        # Workarounds for receivers that are sensitive to iblk wrap-around:
+        #  - --iptrinc: make iptr a real 32-bit sample pointer (increments by 174 per packet)
+        #  - --iblk_zero: force iblk to 0 (use only if QMAP/QMAP-wf breaks after ~1–2 minutes)
+        iblk_field = 0 if args.iblk_zero else int(iblk & 0xFFFF)
+        header = struct.pack(
+            HEADER_FMT,
+            float(cfreq_mhz),
+            int(msec),
+            float(args.userfreq),
+            int(iptr),
+            int(iblk_field),
+            int(nrx),
+            bytes([iusb])
+        )
+
+        if use_int16:
+            # Behold opprinnelig int16 TIMF2-pakking: to int16 + 4 nullbyte per par.
+            s = (np.clip(iq_174, -1.0, 1.0) * float(args.int16_scale)).astype('<i2')
+            words = np.zeros((PKT_DOUBLES, 4), dtype='<i2')
+            words[:, :2] = s
+            payload = words.tobytes(order='C')
+        else:
+            # Vektorisert little-endian float32 interleaved I,Q; 174*8 = 1392 B.
+            payload = np.ascontiguousarray(iq_174, dtype='<f4').tobytes(order='C')
+        pkt = header + payload
+        if len(pkt) == BYTES_PER_PACKET:
+            try: sock.sendto(pkt, target); pkts += 1
+            except Exception as e: print(f"UDP send error: {e}", file=sys.stderr)
+
+        # Oppdater tellere
+        iblk = (iblk + 1) & 0xFFFF
+        if args.iptrinc:
+            # iptr is used by many TIMF2 receivers as the sample pointer.
+            # Keep within signed int32 range.
+            iptr = (iptr + PKT_DOUBLES) & 0x7FFFFFFF
+        if args.debug and (time.time() - last_stats_t) > 1.0:
+            lvl_dbfs = 20.0*math.log10(max(1e-9, float(np.sqrt(np.mean(iq_174*iq_174)))))
+            print(f"pkts/s={pkts}  cfreq={cfreq_mhz:.6f} MHz  in_rate={in_rate:.0f}  nrx={nrx}  "
+                  f"gain={args.gain}  int16_scale={args.int16_scale if use_int16 else 0}  agc={'ON' if args.agc else 'OFF'}  lvl~{lvl_dbfs:.1f} dBFS")
+            pkts = 0; last_stats_t = time.time()
+
+    last_rms_t = time.monotonic()
+    input_frames = 0
+    overflow_count = 0
+    sample_buf = np.empty((0, 2), dtype=np.float32)
+    last_diag = time.monotonic()
+    stats_last_frames = 0
+    stats_last_overflows = 0
+
+    try:
+        with stream:
+            while True:
+                # Blocking read av 2048 samples; statusflagg rapporterer input-overflow.
+                data, overflowed = stream.read(read_frames)
+                if overflowed:
+                    overflow_count += 1
+                    print(f"WARNING: DAX input overflow #{overflow_count} (samples may be lost)",
+                          file=sys.stderr, flush=True)
+                if data is None or data.size == 0:
+                    continue
+                input_frames += len(data)
+                cfreq_mhz = state.get_center_mhz_for(args.daxiq)
+                if cfreq_mhz is None:
+                    # Før API har funnet senterfrekvensen: ikke send stale IQ senere.
+                    sample_buf = np.empty((0, 2), dtype=np.float32)
+                    if resamp is not None:
+                        resamp.buf = np.empty((0, 2), dtype=np.float32)
+                        resamp.t = 0.0
+                    continue
+
+                if resamp is not None:
+                    resamp.push(data)
+                    num = resamp.available_output_frames()
+                    if num > 0:
+                        out = resamp.pop_frames(num)
+                    else:
+                        out = np.empty((0, 2), dtype=np.float32)
+                else:
+                    out = data
+                if len(out):
+                    # Bevar resten (0..173 samples) til neste innlesing.
+                    sample_buf = np.concatenate((sample_buf, out), axis=0)
+                    complete = (len(sample_buf) // FRAMES_PER_PACKET) * FRAMES_PER_PACKET
+                    if complete:
+                        for pos in range(0, complete, FRAMES_PER_PACKET):
+                            blk = preprocess_block(sample_buf[pos:pos+FRAMES_PER_PACKET])
+                            send_packet_block(blk, cfreq_mhz)
+                        sample_buf = sample_buf[complete:].copy()
+
+                now = time.monotonic()
+                if args.rms and (now - last_rms_t) >= 1.0:
+                    rms = float(np.sqrt(np.mean(data * data)))
+                    mx = float(np.max(np.abs(data)))
+                    print(f"RMS={rms:.6f} max|x|={mx:.6f}", flush=True)
+                    last_rms_t = now
+                if args.debug and (now - last_diag) >= 5.0:
+                    dt = now - last_diag
+                    rate = (input_frames - stats_last_frames) / dt
+                    print(f"[DAX] input_frames/s={rate:.1f} "
+                          f"overflows(+{overflow_count - stats_last_overflows})={overflow_count} "
+                          f"fifo_frames={len(sample_buf)}", flush=True)
+                    stats_last_frames = input_frames
+                    stats_last_overflows = overflow_count
+                    last_diag = now
+    except KeyboardInterrupt:
+        print("\nExiting.")
+    except Exception as e:
+        print(f"Error in main loop: {e}", file=sys.stderr); sys.exit(1)
+
+def main():
+    ap = argparse.ArgumentParser(description="Flex DAX IQ to QMAP UDP (cfreq in MHz, adjustable int16)")
+    ap.add_argument("--radio", help="Flex radio IP (SmartSDR TCP API, port 4992)")
+    ap.add_argument("--daxiq", type=int, default=1, help="DAX IQ channel (default 1)")
+    ap.add_argument("--host", default="127.0.0.1", help="QMAP IP/host (default 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=50004, help="QMAP UDP port (default 50004)")
+    ap.add_argument("--gui", action="store_true", help="Open the graphical launcher")
+    ap.add_argument("--userfreq", type=float, default=0.0, help="Optional userfreq field (float)")
+    ap.add_argument("--device", default=None, help="Override input device name/substring match")
+    ap.add_argument("--nrx", type=int, default=-1, choices=[-1,2], help="r*4 format code: -1 (default) or +2")
+    ap.add_argument("--int16", action="store_true", help="Use i*2 (int16) with nrx=+1")
+    ap.add_argument("--int16_scale", type=int, default=8192, help="Full-scale for int16 (default 8192)")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--swapiq", dest="swapiq", action="store_true", help="Swap (I,Q) -> (Q,I) (default)")
+    g.add_argument("--noswapiq", dest="swapiq", action="store_false", help="Do not swap I/Q")
+    ap.set_defaults(swapiq=True)
+    ap.add_argument("--invertq", action="store_true", help="Set Q := -Q")
+    ap.add_argument("--iptrinc", action="store_true", help="Increment iptr (32-bit) by 174 per packet (recommended for stability)")
+    ap.add_argument("--iblk_zero", action="store_true", help="Force iblk=0 in the header (workaround if the receiver misbehaves on wrap)")
+    ap.add_argument("--gain", type=float, default=30.0, help="Scale input (default 1.0)")
+    ap.add_argument("--tone", type=float, default=0.0, help="Inject complex test tone in Hz (0=off)")
+    ap.add_argument("--dcblock", action="store_true", help="Remove DC per block")
+    ap.add_argument("--mix", type=float, default=-48000.0, help="Complex frequency shift in Hz (0=off)")
+    ap.add_argument("--agc", action="store_true", help="Enable simple AGC")
+    ap.add_argument("--agc_target_dbfs", type=float, default=-20.0, help="AGC target (dBFS), default -20")
+    ap.add_argument("--agc_speed", type=float, default=1.5, help="AGC speed (relative), default 1.5")
+    ap.add_argument("--rms", action="store_true", help="Log RMS/max|x| once per second")
+    ap.add_argument("--debug", action="store_true", help="Debug prints")
+    args = ap.parse_args()
+    if args.gui:
+        launch_gui(args)
+        return
+    if not args.radio:
+        ap.error("--radio is required unless --gui is used")
+    run_bridge(args)
+
+def launch_gui(args):
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    root = tk.Tk()
+    root.title("FlexQMAP")
+    root.minsize(620, 560)
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(1, weight=1)
+
+    settings = ttk.Frame(root, padding=12)
+    settings.grid(row=0, column=0, sticky="ew")
+    settings.columnconfigure(1, weight=1)
+    settings.columnconfigure(3, weight=1)
+
+    fields = {
+        "radio": tk.StringVar(value=args.radio or ""),
+        "daxiq": tk.StringVar(value=str(args.daxiq)),
+        "host": tk.StringVar(value=args.host),
+        "port": tk.StringVar(value=str(args.port)),
+        "device": tk.StringVar(value=args.device or ""),
+        "gain": tk.StringVar(value=str(args.gain)),
+        "mix": tk.StringVar(value=str(args.mix)),
+        "agc_target_dbfs": tk.StringVar(value=str(args.agc_target_dbfs)),
+        "agc_speed": tk.StringVar(value=str(args.agc_speed)),
+        "int16_scale": tk.StringVar(value=str(args.int16_scale)),
+    }
+
+    def add_field(row, column, label, key, width=22):
+        ttk.Label(settings, text=label).grid(row=row, column=column, sticky="w", padx=(0, 6), pady=4)
+        entry = ttk.Entry(settings, textvariable=fields[key], width=width)
+        entry.grid(row=row, column=column + 1, sticky="ew", padx=(0, 12), pady=4)
+
+    add_field(0, 0, "Flex radio IP", "radio")
+    add_field(0, 2, "DAX IQ channel", "daxiq")
+    add_field(1, 0, "QMAP host", "host")
+    add_field(1, 2, "QMAP UDP port", "port")
+    add_field(2, 0, "Device override", "device")
+    add_field(3, 0, "Gain", "gain")
+    add_field(3, 2, "Mix frequency (Hz)", "mix")
+    add_field(4, 0, "AGC target (dBFS)", "agc_target_dbfs")
+    add_field(4, 2, "AGC speed", "agc_speed")
+    add_field(5, 0, "Int16 scale", "int16_scale")
+
+    ttk.Label(
+        settings,
+        text="Device override is optional; DAXv1 and DAXv2 names are detected automatically.",
+        wraplength=560,
+    ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(2, 6))
+
+    options = ttk.Frame(settings)
+    options.grid(row=7, column=0, columnspan=4, sticky="w")
+    option_values = {
+        "swapiq": tk.BooleanVar(value=args.swapiq),
+        "invertq": tk.BooleanVar(value=args.invertq),
+        "dcblock": tk.BooleanVar(value=args.dcblock),
+        "agc": tk.BooleanVar(value=args.agc),
+        "int16": tk.BooleanVar(value=args.int16),
+        "rms": tk.BooleanVar(value=args.rms),
+        "debug": tk.BooleanVar(value=args.debug),
+    }
+    for column, (key, label) in enumerate((
+        ("swapiq", "Swap I/Q"),
+        ("invertq", "Invert Q"),
+        ("dcblock", "Remove DC"),
+        ("agc", "Enable AGC"),
+        ("int16", "Send int16"),
+        ("rms", "Show RMS"),
+        ("debug", "Debug"),
+    )):
+        ttk.Checkbutton(options, text=label, variable=option_values[key]).grid(
+            row=0, column=column, sticky="w", padx=(0, 10), pady=4
+        )
+
+    log_frame = ttk.LabelFrame(root, text="Output", padding=8)
+    log_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+    log_frame.columnconfigure(0, weight=1)
+    log_frame.rowconfigure(0, weight=1)
+    output = tk.Text(log_frame, height=12, wrap="word", state="disabled")
+    scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=output.yview)
+    output.configure(yscrollcommand=scrollbar.set)
+    output.grid(row=0, column=0, sticky="nsew")
+    scrollbar.grid(row=0, column=1, sticky="ns")
+
+    controls = ttk.Frame(root, padding=(12, 0, 12, 12))
+    controls.grid(row=2, column=0, sticky="ew")
+    log_queue = queue.Queue()
+    active_process = None
+
+    def append_output(line):
+        output.configure(state="normal")
+        output.insert("end", line + "\n")
+        output.see("end")
+        output.configure(state="disabled")
+
+    def poll_output():
+        nonlocal active_process
+        while True:
+            try:
+                kind, value = log_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "line":
+                append_output(value)
+            elif kind == "exit":
+                append_output(f"Bridge stopped (exit code {value}).")
+                active_process = None
+                start_button.configure(state="normal")
+                stop_button.configure(state="disabled")
+            elif kind == "error":
+                append_output(f"Could not start bridge: {value}")
+                active_process = None
+                start_button.configure(state="normal")
+                stop_button.configure(state="disabled")
+        root.after(100, poll_output)
+
+    def start_bridge():
+        nonlocal active_process
+        if active_process is not None and active_process.poll() is None:
+            return
+        if not fields["radio"].get().strip():
+            messagebox.showerror("Missing radio address", "Enter the Flex radio IP address.")
+            return
+        command = [
+            sys.executable, os.path.abspath(__file__),
+            "--radio", fields["radio"].get().strip(),
+            "--daxiq", fields["daxiq"].get().strip(),
+            "--host", fields["host"].get().strip(),
+            "--port", fields["port"].get().strip(),
+            "--gain", fields["gain"].get().strip(),
+            "--mix", fields["mix"].get().strip(),
+            "--agc_target_dbfs", fields["agc_target_dbfs"].get().strip(),
+            "--agc_speed", fields["agc_speed"].get().strip(),
+            "--int16_scale", fields["int16_scale"].get().strip(),
+        ]
+        if fields["device"].get().strip():
+            command.extend(("--device", fields["device"].get().strip()))
+        command.append("--swapiq" if option_values["swapiq"].get() else "--noswapiq")
+        for key in ("invertq", "dcblock", "agc", "int16", "rms", "debug"):
+            if option_values[key].get():
+                command.append("--" + key)
+        try:
+            active_process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            messagebox.showerror("Could not start bridge", str(exc))
+            return
+
+        process = active_process
+        start_button.configure(state="disabled")
+        stop_button.configure(state="normal")
+        append_output("Starting bridge...")
+
+        def read_process_output():
+            if process.stdout is not None:
+                for line in process.stdout:
+                    log_queue.put(("line", line.rstrip()))
+            log_queue.put(("exit", process.wait()))
+
+        threading.Thread(target=read_process_output, daemon=True).start()
+
+    def stop_bridge():
+        if active_process is not None and active_process.poll() is None:
+            active_process.terminate()
+
+    def close_window():
+        if active_process is not None and active_process.poll() is None:
+            active_process.terminate()
+        root.destroy()
+
+    start_button = ttk.Button(controls, text="Start bridge", command=start_bridge)
+    start_button.pack(side="left")
+    stop_button = ttk.Button(controls, text="Stop", command=stop_bridge, state="disabled")
+    stop_button.pack(side="left", padx=(8, 0))
+    root.protocol("WM_DELETE_WINDOW", close_window)
+    root.after(100, poll_output)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
