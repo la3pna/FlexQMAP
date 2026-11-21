@@ -77,3 +77,13 @@ Prints basic signal stats.
 
 ### `--debug`
 Verbose debug output.
+
+
+
+### USING THE BRIDGE WITH V4.3 SMARTSDR
+For now, download and run qmap_flex_daxv2.py in order to get it working with DAX 2. 
+Run the code with: python qmap_flex_daxv2.py --gui
+
+
+My configuration that works with QMAP gain = 5, Zero = 17: 
+<img width="707" height="597" alt="image" src="https://github.com/user-attachments/assets/006ed68d-d322-4b6e-83e2-8fbf0ee31353" />
